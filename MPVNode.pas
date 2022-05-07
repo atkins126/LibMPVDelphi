@@ -17,7 +17,7 @@ type
     constructor Create;
     destructor Destroy; override;
     procedure Clear; override;
-    procedure Assign(cNL: TMPVNodeList);
+    procedure Assign(Source: TPersistent); override;
 
     function GetNode(i: Integer): TMPVNode;
     function FindNode(const sKey: string): TMPVNode;
@@ -95,6 +95,7 @@ type
     property BytesPtr: Pointer read m_pBytes;
     property ByteLength: size_t read m_nBytesLen;
     property Nodes: TMPVNodeList read GetAsNodes write SetAsNodes;
+
     property Value: Variant read GetAsVariant;
   end;
 
@@ -112,7 +113,7 @@ begin
   MPV_FORMAT_INT64: Result := PMPVInt64(pData)^;
   MPV_FORMAT_DOUBLE: Result := PDouble(pData)^;
   MPV_FORMAT_FLAG: Result := PMPVFlag(pData)^;
-  MPV_FORMAT_STRING, MPV_FORMAT_OSD_STRING: Result := UTF8Decode(PPMPVChar(pData)^);
+  MPV_FORMAT_STRING, MPV_FORMAT_OSD_STRING: Result := UTF8ToString(PPMPVChar(pData)^);
   MPV_FORMAT_NODE, MPV_FORMAT_NODE_ARRAY, MPV_FORMAT_NODE_MAP, MPV_FORMAT_BYTE_ARRAY:
     begin
       cNode := TMPVNode.Create;
@@ -130,27 +131,33 @@ begin
   Result := AddObject(sKey, cNode);
 end;
 
-procedure TMPVNodeList.Assign(cNL: TMPVNodeList);
+procedure TMPVNodeList.Assign(Source: TPersistent);
 var
   i: Integer;
   s: string;
   cNode, cNewNode: TMPVNode;
+  cNL: TMPVNodeList;
 begin
-  if cNL<>nil then
+  if Source is TMPVNodeList then
   begin
-    for i := 0 to cNL.Count-1 do
+    cNL := TMPVNodeList(Source);
+    if cNL<>nil then
     begin
-      s := cNL[i];
-      cNode := TMPVNode(cNL.Objects[i]);
-      cNewNode := TMPVNode.Create;
-      if AddObject(s, cNewNode)>=0 then
+      for i := 0 to cNL.Count-1 do
       begin
-        cNewNode.Assign(cNode);
-      end else
-        cNewNode.Free;
-    end;
+        s := cNL[i];
+        cNode := TMPVNode(cNL.Objects[i]);
+        cNewNode := TMPVNode.Create;
+        if AddObject(s, cNewNode)>=0 then
+        begin
+          cNewNode.Assign(cNode);
+        end else
+          cNewNode.Free;
+      end;
+    end else
+      Clear;
   end else
-    Clear;
+    inherited Assign(Source);
 end;
 
 procedure TMPVNodeList.Clear;
@@ -211,7 +218,14 @@ end;
 
 function TMPVNode.AddNode(const sKey: string; cNode: TMPVNode): Integer;
 begin
-  m_nFmt := MPV_FORMAT_NODE_ARRAY;
+  case m_nFmt of
+  MPV_FORMAT_NODE_ARRAY, MPV_FORMAT_NODE_MAP: ;
+  else
+    begin
+      if sKey='' then m_nFmt := MPV_FORMAT_NODE_ARRAY else
+        m_nFmt := MPV_FORMAT_NODE_MAP;
+    end;
+  end;
   if m_cNodes=nil then m_cNodes := TMPVNodeList.Create;
   Result := m_cNodes.AddNode(sKey, cNode);
 end;
@@ -257,7 +271,14 @@ end;
 
 function TMPVNode.CopyNode(const sKey: string; cNode: TMPVNode): Integer;
 begin
-  m_nFmt := MPV_FORMAT_NODE_ARRAY;
+  case m_nFmt of
+  MPV_FORMAT_NODE_ARRAY, MPV_FORMAT_NODE_MAP: ;
+  else
+    begin
+      if sKey='' then m_nFmt := MPV_FORMAT_NODE_ARRAY else
+        m_nFmt := MPV_FORMAT_NODE_MAP;
+    end;
+  end;
   if m_cNodes=nil then m_cNodes := TMPVNodeList.Create;
   Result := m_cNodes.CopyNode(sKey, cNode);
 end;
@@ -285,7 +306,7 @@ begin
     MPV_FORMAT_NONE: ;
     MPV_FORMAT_STRING, MPV_FORMAT_OSD_STRING:
       begin
-        m_sVal := UTF8Decode(PMPVChar(pNode^.u.str));
+        m_sVal := UTF8ToString(PMPVChar(pNode^.u.str));
       end;
     MPV_FORMAT_FLAG:
       begin
@@ -311,7 +332,7 @@ begin
           begin
             cNewNode := TMPVNode.Create;
             cNewNode.LoadFromMPVNode(pn, False); // do not free content
-            if ppc<>nil then sKey := UTF8Decode(ppc^) else sKey := '';
+            if ppc<>nil then sKey := UTF8ToString(ppc^) else sKey := '';
             if m_cNodes.AddNode(sKey, cNewNode)<0 then cNewNode.Free;
           end;
           if ppc<>nil then Inc(ppc);
@@ -417,10 +438,15 @@ begin
   MPV_FORMAT_STRING, MPV_FORMAT_OSD_STRING:
     begin
       sUTF8 := UTF8Encode(m_sVal);
-      n := Length(sUTF8)+1; // #0
+      n := Length(sUTF8)+1; // add #0
       GetMem(pNode^.u.str, n);
       if pNode^.u.str<>nil then
-        Move(PAnsiChar(@sUTF8[1])^, pNode^.u.str^, n);
+      begin
+        if n=1 then
+          pNode^.u.str^ := #0
+        else
+          Move(PAnsiChar(@sUTF8[1])^, pNode^.u.str^, n);
+      end;
     end;
   MPV_FORMAT_FLAG:
     begin
@@ -538,7 +564,7 @@ begin
     end;
   MPV_FORMAT_NODE, MPV_FORMAT_NODE_ARRAY, MPV_FORMAT_NODE_MAP:
     begin
-      Result := Format('nodes[%d]', [m_cNodes.Count]); // no way to represent
+      Result := Format('nodes[%d]', [m_cNodes.Count]); // not easy to represent
     end;
   MPV_FORMAT_BYTE_ARRAY:
     begin
@@ -595,7 +621,6 @@ procedure TMPVNode.SaveToStrings(cList: TStrings; const sPrefix: string);
 var
   i: Integer;
   cNode: TMPVNode;
-  s: string;
 begin
   case m_nFmt of
   MPV_FORMAT_STRING, MPV_FORMAT_OSD_STRING:
@@ -651,8 +676,15 @@ begin
 end;
 
 procedure TMPVNode.SetAsNodes(const Value: TMPVNodeList);
+var
+  s: string;
 begin
   m_nFmt := MPV_FORMAT_NODE_ARRAY;
+  for s in Value do
+  begin
+    if s<>'' then
+      m_nFmt := MPV_FORMAT_NODE_MAP;
+  end;
   if m_cNodes=nil then m_cNodes := TMPVNodeList.Create;
   m_cNodes.Assign(Value);
 end;
