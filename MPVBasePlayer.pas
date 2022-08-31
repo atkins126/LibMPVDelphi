@@ -3,9 +3,14 @@ unit MPVBasePlayer;
 // MPV base player classes
 // Author: Edward G. (nbuyer@gmail.com)
 
+{.$DEFINE MPV_DYNAMIC_LOAD} // should define in project options "Conditional defines"
+
 interface
 
 uses
+  {$IFDEF MSWINDOWS}
+  Windows,
+  {$ENDIF}
   SysUtils, Classes, SyncObjs, Variants,
   MPVConst, MPVClient, MPVNode, MPVTrack;
 
@@ -17,7 +22,7 @@ type
   TMPVErrorCode = Integer;
   TMPVException = class(Exception);
 
-  TMPVPlayerState = (mpsUnk, mpsPlay, mpsStep, mpsPause, mpsStop, mpsEnd, mpsErr);
+  TMPVPlayerState = (mpsUnk, mpsLoading, mpsPlay, mpsStep, mpsPause, mpsStop, mpsEnd, mpsErr);
 
   TMPVEventThread = class(TThread)
   private
@@ -48,7 +53,7 @@ type
 
   TMPVBasePlayer = class
   private
-    m_cLock: TCriticalSection;
+    m_cLock: SyncObjs.TCriticalSection;
     m_cEventThrd: TMPVEventThread; // Thread to process events
     m_fEventWait: Double; // Wait event seconds
     m_eOnFileOpen: TMPVFileOpen;
@@ -77,7 +82,7 @@ type
   protected
     m_hMPV: PMPVHandle; // MPV Handle
 
-    m_fLenInSec, m_fCurSec: Double; // Total / current seconds
+    m_fLenInSec, m_fCurSec: Double; // Total / current seconds   "time-pos"
     m_fSpeed: Double; // Speed
     m_fVol: Double; // Volume
     m_nX, m_nY: Int64; // Video width/height
@@ -141,24 +146,26 @@ type
     // Send command(s) to MPV
     function CommandStr(const sCmd: string): TMPVErrorCode;
     function CommandList(cCmds: TStrings; nID: MPVUInt64 = 0): TMPVErrorCode;
-    function Command(yCmds: array of string; nID: MPVUInt64 = 0): TMPVErrorCode;
+    function Command(const yCmds: array of string; nID: MPVUInt64 = 0): TMPVErrorCode;
 
     // Get property from MPV
-    function GetPropertyBool(const sName: string; var Value: Boolean): TMPVErrorCode;
+    function GetPropertyBool(const sName: string; var Value: Boolean; bLogError: Boolean = True): TMPVErrorCode;
     function SetPropertyBool(const sName: string; Value: Boolean; nID: MPVUInt64 = 0): TMPVErrorCode;
-    function GetPropertyInt64(const sName: string; var Value: Int64): TMPVErrorCode;
+    function GetPropertyInt64(const sName: string; var Value: Int64; bLogError: Boolean = True): TMPVErrorCode;
     function SetPropertyInt64(const sName: string; Value: Int64; nID: MPVUInt64 = 0): TMPVErrorCode;
-    function GetPropertyDouble(const sName: string; var Value: Double): TMPVErrorCode;
+    function GetPropertyDouble(const sName: string; var Value: Double; bLogError: Boolean = True): TMPVErrorCode;
     function SetPropertyDouble(const sName: string; Value: Double; nID: MPVUInt64 = 0): TMPVErrorCode;
-    function GetPropertyString(const sName: string; var Value: string): TMPVErrorCode;
+    function GetPropertyString(const sName: string; var Value: string; bLogError: Boolean = True): TMPVErrorCode;
     function SetPropertyString(const sName, sValue: string; nID: MPVUInt64 = 0): TMPVErrorCode;
-    function GetPropertyNode(const sName: string; cNode: TMPVNode): TMPVErrorCode;
+    function GetPropertyNode(const sName: string; cNode: TMPVNode; bLogError: Boolean = True): TMPVErrorCode;
 
     // Observe property, set OnPropertyChanged to handle the change event
     function ObservePropertyBool(const sName: string; nID: UInt64): TMPVErrorCode;
     function ObservePropertyInt64(const sName: string; nID: UInt64): TMPVErrorCode;
     function ObservePropertyDouble(const sName: string; nID: UInt64): TMPVErrorCode;
     function ObservePropertyString(const sName: string; nID: UInt64): TMPVErrorCode;
+
+    function UnobserveProperty(nID: UInt64): TMPVErrorCode;
 
     // Open file/URL to play
     function OpenFile(const sFullName: string): TMPVErrorCode;
@@ -200,7 +207,7 @@ type
     property VideoHeight: Int64 read m_nY;
     property Volume: Double read m_fVol write SetVol;
     property AudioDevice: string read GetAudioDev write SetAudioDev;
-    property AudioDeviceList: string read GetAudioDevList;
+    //property AudioDeviceList: string read GetAudioDevList;
 
     // These events are called from another thread, be sure to use
     // TThread.Synchronize() if you want to update UI.
@@ -210,8 +217,11 @@ type
     property OnPropertyChanged: TMPVPropertyChangedEvent read GetOnProgChg write SetOnProgChg;
   end;
 
+function MPVLibLoaded(const sLibPath: string): Boolean;
 
 implementation
+
+
 
 { TMPVEventThread }
 
@@ -245,7 +255,7 @@ end;
 
 { TMPVBasePlayer }
 
-function TMPVBasePlayer.Command(yCmds: array of string; nID: MPVUInt64): TMPVErrorCode;
+function TMPVBasePlayer.Command(const yCmds: array of string; nID: MPVUInt64): TMPVErrorCode;
 var
   cStr: TStringList;
   i: Integer;
@@ -349,7 +359,7 @@ end;
 
 constructor TMPVBasePlayer.Create;
 begin
-  m_cLock := TCriticalSection.Create;
+  m_cLock := SyncObjs.TCriticalSection.Create;
   m_cTrackList := TMPVTrackList.Create();
   m_eState := mpsUnk;
   inherited Create;
@@ -535,11 +545,12 @@ var
   sPF, sLvl, sMsg: string;
   eOnErr: TMPVErrorMessage;
 begin
-  sPF := pLM^.prefix;
+  sPF := string(pLM^.prefix);
   sLvl := string(UTF8ToString(pLM^.level));
   sMsg := string(UTF8ToString(pLM^.text));
-  Log(Format('MPV: prefix=%s, loglevel=%d, level=%s, msg=%s', [sPF,
-    pLM^.log_level, sLvl, sMsg]), False);
+  //if Length(sMsg)>1 then // $0a
+    Log(Format('MPV: prefix=%s, loglevel=%d, level=%s, msg=%s', [sPF,
+      pLM^.log_level, sLvl, sMsg]), False);
   if (sLvl='error') then
   begin
     m_cLock.Enter;
@@ -754,7 +765,7 @@ end;
 function TMPVBasePlayer.DoEventVideoReconfig: TMPVErrorCode;
 begin
   // Could be error at the beginning
-  if GetPropertyInt64(STR_DWIDTH, m_nX)=MPV_ERROR_SUCCESS then
+  if GetPropertyInt64(STR_DWIDTH, m_nX, False)=MPV_ERROR_SUCCESS then
   begin
     if GetPropertyInt64(STR_DHEIGHT, m_nY)=MPV_ERROR_SUCCESS then
       DoSetVideoSize;
@@ -779,7 +790,7 @@ begin
   begin
     // This call might cause very long time when debugging in Delphi,
     // but pretty fast when running alone.
-    mpv_destroy(m_hMPV);
+    mpv_terminate_destroy(m_hMPV); //mpv_destroy(m_hMPV);
     //TMPVDestroyThread.Create(m_hMPV);
     m_hMPV := nil;
   end;
@@ -828,7 +839,7 @@ begin
 end;
 
 function TMPVBasePlayer.GetPropertyBool(const sName: string;
-  var Value: Boolean): TMPVErrorCode;
+  var Value: Boolean; bLogError: Boolean): TMPVErrorCode;
 var
   sNm: UTF8String;
   n: MPVInt;
@@ -840,13 +851,20 @@ begin
   end;
   sNm := UTF8Encode(sName);
   n := 0;
-  Result := HandleError(mpv_get_property(m_hMPV, PMPVChar(sNm),
-    MPV_FORMAT_FLAG, @n), 'mpv_get_property(bool):'+sName);
-  Value := n<>0;
+  Result := mpv_get_property(m_hMPV, PMPVChar(sNm),
+    MPV_FORMAT_FLAG, @n);
+  if Result<>MPV_ERROR_SUCCESS then
+  begin
+    if bLogError then
+      HandleError(Result, 'mpv_get_property(bool):'+sName);
+  end else
+  begin
+    Value := n<>0;
+  end;
 end;
 
 function TMPVBasePlayer.GetPropertyDouble(const sName: string;
-  var Value: Double): TMPVErrorCode;
+  var Value: Double; bLogError: Boolean): TMPVErrorCode;
 var
   sNm: UTF8String;
 begin
@@ -856,12 +874,17 @@ begin
     Exit;
   end;
   sNm := UTF8Encode(sName);
-  Result := HandleError(mpv_get_property(m_hMPV, PMPVChar(sNm),
-    MPV_FORMAT_DOUBLE, @Value), 'mpv_get_property(dbl):'+sName);
+  Result := mpv_get_property(m_hMPV, PMPVChar(sNm),
+    MPV_FORMAT_DOUBLE, @Value);
+  if Result<>MPV_ERROR_SUCCESS then
+  begin
+    if bLogError then
+      HandleError(Result, 'mpv_get_property(dbl):'+sName);
+  end;
 end;
 
 function TMPVBasePlayer.GetPropertyInt64(const sName: string;
-  var Value: Int64): TMPVErrorCode;
+  var Value: Int64; bLogError: Boolean): TMPVErrorCode;
 var
   sNm: UTF8String;
 begin
@@ -871,12 +894,17 @@ begin
     Exit;
   end;
   sNm := UTF8Encode(sName);
-  Result := HandleError(mpv_get_property(m_hMPV, PMPVChar(sNm),
-    MPV_FORMAT_INT64, @Value), 'mpv_get_property(i64):'+sName);
+  Result := mpv_get_property(m_hMPV, PMPVChar(sNm),
+    MPV_FORMAT_INT64, @Value);
+  if Result<>MPV_ERROR_SUCCESS then
+  begin
+    if bLogError then
+      HandleError(Result, 'mpv_get_property(i64):'+sName);
+  end;
 end;
 
 function TMPVBasePlayer.GetPropertyNode(const sName: string;
-  cNode: TMPVNode): TMPVErrorCode;
+  cNode: TMPVNode; bLogError: Boolean): TMPVErrorCode;
 var
   sNm: UTF8String;
   P: P_mpv_node;
@@ -888,8 +916,13 @@ begin
   end;
   sNm := UTF8Encode(sName);
   P := nil;
-  Result := HandleError(mpv_get_property(m_hMPV, PMPVChar(sNm),
-    MPV_FORMAT_NODE, @P), 'mpv_get_property(node):'+sName);
+  Result := mpv_get_property(m_hMPV, PMPVChar(sNm),
+    MPV_FORMAT_NODE, @P);
+  if Result<>MPV_ERROR_SUCCESS then
+  begin
+    if bLogError then
+      HandleError(Result, 'mpv_get_property(node):'+sName);
+  end;
   if P<>nil then
   begin
     // Get value and free
@@ -898,7 +931,7 @@ begin
 end;
 
 function TMPVBasePlayer.GetPropertyString(const sName: string;
-  var Value: string): TMPVErrorCode;
+  var Value: string; bLogError: Boolean): TMPVErrorCode;
 var
   sNm: UTF8String;
   P: PMPVChar;
@@ -910,8 +943,13 @@ begin
   end;
   sNm := UTF8Encode(sName);
   P := nil;
-  Result := HandleError(mpv_get_property(m_hMPV, PMPVChar(sNm),
-    MPV_FORMAT_STRING, @P), 'mpv_get_property(str):'+sName);
+  Result := mpv_get_property(m_hMPV, PMPVChar(sNm),
+    MPV_FORMAT_STRING, @P);
+  if Result<>MPV_ERROR_SUCCESS then
+  begin
+    if bLogError then
+      HandleError(Result, 'mpv_get_property(str):'+sName);
+  end;
   if P<>nil then
   begin
     // Get value and free
@@ -947,6 +985,12 @@ end;
 function TMPVBasePlayer.InitPlayer(const sWinHandle, sConfigDir: string;
   fEventWait: Double): TMPVErrorCode;
 begin
+  if not MPVLibLoaded('') then
+  begin
+    Result := MPV_ERROR_LOADING_FAILED;
+    Exit;
+  end;
+
   FreePlayer();
 
   // Basic procedure copied from MPV.NET
@@ -964,10 +1008,13 @@ begin
   SetPropertyString('input-terminal', 'yes');
   SetPropertyString('msg-level', 'osd/libass=fatal');
 {$ENDIF}
-  SetPropertyInt64('osd-duration', 2000);
-//  SetPropertyString('watch-later-options', 'mute');
-//  SetPropertyString('screenshot-directory', g_sMPVCfgDir);
-  SetPropertyString('osd-playing-msg', '${filename}');
+  //SetPropertyString('watch-later-options', STR_MUTE+','+STR_SID+','+STR_AID);
+  SetPropertyString('screenshot-directory', sConfigDir);
+//  SetPropertyInt64('osd-duration', 2000);
+//  SetPropertyString('osd-playing-msg', '${filename}');
+{$IFDEF DEBUG}
+  SetPropertyString(STR_LOG_FILE, ExtractFilePath(ParamStr(0))+'mpvlog.txt');
+{$ENDIF}
   SetPropertyString(STR_WID, sWinHandle);
   SetPropertyString('osc', 'yes'); // On Screen Control
   SetPropertyString('force-window', 'yes');
@@ -996,7 +1043,7 @@ begin
   ObservePropertyDouble(STR_VOLUME, ID_VOLUME);
   ObserveProperty(STR_TRACK_LIST, ID_TRACK_LIST); // Node
   ObservePropertyString(STR_AUDIO_DEV, ID_AUDIO_DEV);
-  ObservePropertyString(STR_AUDIO_DEV_LIST, ID_AUDIO_DEV_LIST);
+  //ObservePropertyString(STR_AUDIO_DEV_LIST, ID_AUDIO_DEV_LIST); // May cause unknown error
 
 //  ObservePropertyBool(STR_WIN_MAX, ID_WIN_MAX);
 //  ObservePropertyBool(STR_WIN_MIN, ID_WIN_MIN);
@@ -1080,6 +1127,7 @@ end;
 
 function TMPVBasePlayer.OpenFile(const sFullName: string): TMPVErrorCode;
 begin
+  m_eState := mpsLoading;
   Result := Command([CMD_LOAD_FILE, sFullName]);
   SetPropertyBool(STR_PAUSE, False);
 end;
@@ -1335,5 +1383,104 @@ procedure TMPVBasePlayer.Unlock;
 begin
   m_cLock.Leave;
 end;
+
+function TMPVBasePlayer.UnobserveProperty(nID: UInt64): TMPVErrorCode;
+begin
+  if m_hMPV=nil then
+  begin
+    Result := MPV_ERROR_UNINITIALIZED;
+    Exit;
+  end;
+  Result := HandleError(mpv_unobserve_property(m_hMPV, nID),
+    'mpv_unobserve_property');
+end;
+
+{$IFDEF MPV_DYNAMIC_LOAD}
+var
+  g_hMPVLib: HMODULE = 0;
+
+procedure MPVLibFree;
+begin
+  if g_hMPVLib<>0 then
+  begin
+    FreeLibrary(g_hMPVLib);
+    g_hMPVLib := 0;
+  end;
+end;
+
+function MPVLibLoaded(const sLibPath: string): Boolean;
+var
+  sLib: string;
+begin
+  Result := Assigned(mpv_client_api_version);
+  if not Result then
+  begin
+    if sLibPath='' then sLib := ExtractFilePath(ParamStr(0))+MPVDLL
+      else sLib := IncludeTrailingPathDelimiter(sLibPath)+MPVDLL;
+    MPVLibFree;
+    g_hMPVLib := SysUtils.SafeLoadLibrary(sLib);
+    if g_hMPVLib<>0 then
+    begin
+      mpv_client_api_version := T_mpv_client_api_version(GetProcAddress(g_hMPVLib, fn_mpv_client_api_version));
+      mpv_error_string := T_mpv_error_string(GetProcAddress(g_hMPVLib, fn_mpv_error_string));
+      mpv_free := T_mpv_free(GetProcAddress(g_hMPVLib, fn_mpv_free));
+      mpv_client_name := T_mpv_client_name(GetProcAddress(g_hMPVLib, fn_mpv_client_name));
+      mpv_client_id := T_mpv_client_id(GetProcAddress(g_hMPVLib, fn_mpv_client_id));
+      mpv_create := T_mpv_create(GetProcAddress(g_hMPVLib, fn_mpv_create));
+      mpv_initialize := T_mpv_initialize(GetProcAddress(g_hMPVLib, fn_mpv_initialize));
+      mpv_destroy := T_mpv_destroy(GetProcAddress(g_hMPVLib, fn_mpv_destroy));
+      mpv_terminate_destroy := T_mpv_terminate_destroy(GetProcAddress(g_hMPVLib, fn_mpv_terminate_destroy));
+      mpv_create_client := T_mpv_create_client(GetProcAddress(g_hMPVLib, fn_mpv_create_client));
+      mpv_create_weak_client := T_mpv_create_weak_client(GetProcAddress(g_hMPVLib, fn_mpv_create_weak_client));
+      mpv_load_config_file := T_mpv_load_config_file(GetProcAddress(g_hMPVLib, fn_mpv_load_config_file));
+      mpv_get_time_us := T_mpv_get_time_us(GetProcAddress(g_hMPVLib, fn_mpv_get_time_us));
+      mpv_free_node_contents := T_mpv_free_node_contents(GetProcAddress(g_hMPVLib, fn_mpv_free_node_contents));
+      mpv_set_option := T_mpv_set_option(GetProcAddress(g_hMPVLib, fn_mpv_set_option));
+      mpv_set_option_string := T_mpv_set_option_string(GetProcAddress(g_hMPVLib, fn_mpv_set_option_string));
+      mpv_command := T_mpv_command(GetProcAddress(g_hMPVLib, fn_mpv_command));
+      mpv_command_node := T_mpv_command_node(GetProcAddress(g_hMPVLib, fn_mpv_command_node));
+      mpv_command_ret := T_mpv_command_ret(GetProcAddress(g_hMPVLib, fn_mpv_command_ret));
+      mpv_command_string := T_mpv_command_string(GetProcAddress(g_hMPVLib, fn_mpv_command_string));
+      mpv_command_async := T_mpv_command_async(GetProcAddress(g_hMPVLib, fn_mpv_command_async));
+      mpv_command_node_async := T_mpv_command_node_async(GetProcAddress(g_hMPVLib, fn_mpv_command_node_async));
+      mpv_abort_async_command := T_mpv_abort_async_command(GetProcAddress(g_hMPVLib, fn_mpv_abort_async_command));
+      mpv_set_property := T_mpv_set_property(GetProcAddress(g_hMPVLib, fn_mpv_set_property));
+      mpv_set_property_string := T_mpv_set_property_string(GetProcAddress(g_hMPVLib, fn_mpv_set_property_string));
+      mpv_set_property_async := T_mpv_set_property_async(GetProcAddress(g_hMPVLib, fn_mpv_set_property_async));
+      mpv_get_property := T_mpv_get_property(GetProcAddress(g_hMPVLib, fn_mpv_get_property));
+      mpv_get_property_string := T_mpv_get_property_string(GetProcAddress(g_hMPVLib, fn_mpv_get_property_string));
+      mpv_get_property_osd_string := T_mpv_get_property_osd_string(GetProcAddress(g_hMPVLib, fn_mpv_get_property_osd_string));
+      mpv_get_property_async := T_mpv_get_property_async(GetProcAddress(g_hMPVLib, fn_mpv_get_property_async));
+      mpv_observe_property := T_mpv_observe_property(GetProcAddress(g_hMPVLib, fn_mpv_observe_property));
+      mpv_unobserve_property := T_mpv_unobserve_property(GetProcAddress(g_hMPVLib, fn_mpv_unobserve_property));
+      mpv_event_name := T_mpv_event_name(GetProcAddress(g_hMPVLib, fn_mpv_event_name));
+      mpv_event_to_node := T_mpv_event_to_node(GetProcAddress(g_hMPVLib, fn_mpv_event_to_node));
+      mpv_request_event := T_mpv_request_event(GetProcAddress(g_hMPVLib, fn_mpv_request_event));
+      mpv_request_log_messages := T_mpv_request_log_messages(GetProcAddress(g_hMPVLib, fn_mpv_request_log_messages));
+      mpv_wait_event := T_mpv_wait_event(GetProcAddress(g_hMPVLib, fn_mpv_wait_event));
+      mpv_wakeup := T_mpv_wakeup(GetProcAddress(g_hMPVLib, fn_mpv_wakeup));
+      mpv_set_wakeup_callback := T_mpv_set_wakeup_callback(GetProcAddress(g_hMPVLib, fn_mpv_set_wakeup_callback));
+      mpv_wait_async_requests := T_mpv_wait_async_requests(GetProcAddress(g_hMPVLib, fn_mpv_wait_async_requests));
+      mpv_hook_add := T_mpv_hook_add(GetProcAddress(g_hMPVLib, fn_mpv_hook_add));
+      mpv_hook_continue := T_mpv_hook_continue(GetProcAddress(g_hMPVLib, fn_mpv_hook_continue));
+      {$IFDEF MPV_ENABLE_DEPRECATED}
+      mpv_get_wakeup_pipe := T_mpv_get_wakeup_pipe(GetProcAddress(g_hMPVLib, fn_mpv_get_wakeup_pipe));
+      {$ENDIF MPV_ENABLE_DEPRECATED}
+      Result := Assigned(mpv_client_api_version);
+    end;
+  end;
+end;
+{$ELSE MPV_DYNAMIC_LOAD}
+function MPVLibLoaded(const sLibPath: string): Boolean;
+begin
+  Result := True;
+end;
+{$ENDIF MPV_DYNAMIC_LOAD}
+
+initialization
+finalization
+{$IFDEF MPV_DYNAMIC_LOAD}
+  MPVLibFree;
+{$ENDIF MPV_DYNAMIC_LOAD}
 
 end.
